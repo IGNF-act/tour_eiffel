@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bâtiments 3D — 500 m autour de la Tour Eiffel</title>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; font-family: Inter, system-ui, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  #panel {
+    position: absolute; top: 12px; left: 12px; z-index: 2;
+    background: rgba(255,255,255,.94); border-radius: 12px;
+    padding: 14px 16px; max-width: 320px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.18);
+  }
+  #panel h1 { font-size: 15px; color: #111827; margin-bottom: 4px; }
+  #panel p { font-size: 12px; color: #4b5563; line-height: 1.45; }
+  #legend {
+    position: absolute; bottom: 30px; left: 12px; z-index: 2;
+    background: rgba(255,255,255,.94); border-radius: 10px;
+    padding: 10px 14px; box-shadow: 0 4px 14px rgba(0,0,0,.16);
+    font-size: 11px; color: #374151;
+  }
+  .leg-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+  .leg-swatch { width: 22px; height: 12px; border-radius: 3px; }
+  #status {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    z-index: 3; background: #fff; padding: 18px 22px; border-radius: 12px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.25); font-size: 13px; color: #374151;
+    text-align: center; max-width: 420px;
+  }
+  .maplibregl-popup-content { font-size: 12px; }
+  .maplibregl-popup-content b { font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>Bâtiments BD TOPO® — rayon 500 m</h1>
+  <p>Bâtiments de la BD TOPO V3 situés à moins de 500 m de la Tour Eiffel, extrudés en 3D selon leur hauteur réelle et colorés selon leur nature. Cliquez sur un bâtiment pour ses détails. Sources : IGN — Géoplateforme (WFS / WMTS).</p>
+</div>
+<div id="legend">
+  <b>Nature du bâtiment</b>
+  <div class="leg-row"><span class="leg-swatch" style="background:#cbd5e1"></span> Indifférenciée</div>
+  <div class="leg-row"><span class="leg-swatch" style="background:#ef4444"></span> Tour</div>
+  <div class="leg-row"><span class="leg-swatch" style="background:#7c3aed"></span> Monument</div>
+  <div class="leg-row"><span class="leg-swatch" style="background:#0ea5e9"></span> Remarquable</div>
+  <div class="leg-row"><span class="leg-swatch" style="background:#f59e0b"></span> Industriel</div>
+  <div class="leg-row"><span class="leg-swatch" style="background:#10b981"></span> Autres</div>
+</div>
+<div id="status">Chargement des bâtiments…</div>
+
+<script>
+const CENTER = [2.29424, 48.858264];
+const RADIUS_M = 500;
+
+// Requête WFS compilée : bâtiments BD TOPO V3 à moins de 500 m de la Tour Eiffel
+const WFS_URL = "https://data.geopf.fr/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=BDTOPO_V3%3Abatiment&outputFormat=application%2Fjson&exceptions=application%2Fjson&count=5000&propertyName=nature%2Cusage_1%2Chauteur%2Cnombre_d_etages%2Cgeometrie&cql_filter=DWITHIN%28geometrie%2CSRID%3D4326%3BPOINT%282.29424+48.858264%29%2C500%2Cmeters%29";
+
+// Fond de plan IGN (Plan IGN v2) — WMTS Géoplateforme, sans clé
+const IGN_PLAN = "https://data.geopf.fr/wmts?SERVICE=WMTS&VERSION=1.0.0&REQUEST=GetTile&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}";
+
+// Génère un cercle approximé (rayon en mètres)
+function circleGeom(lon, lat, r, n = 128) {
+  const dLat = r / 111320, dLon = r / (111320 * Math.cos(lat * Math.PI / 180));
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const a = (2 * Math.PI * i) / n;
+    pts.push([lon + dLon * Math.cos(a), lat + dLat * Math.sin(a)]);
+  }
+  return { type: "Polygon", coordinates: [pts] };
+}
+
+// Couleur selon la nature du bâtiment (BD TOPO V3)
+const NATURE_COLORS = {
+  "Indifférenciée": "#cbd5e1",
+  "Tour": "#ef4444",
+  "Monument": "#7c3aed",
+  "Bâtiment remarquable": "#0ea5e9",
+  "Bâtiment industriel": "#f59e0b"
+};
+const AUTRES_COLOR = "#10b981";
+function natureColor(n) {
+  return NATURE_COLORS[n] || AUTRES_COLOR;
+}
+
+const statusEl = document.getElementById("status");
+if (typeof maplibregl === "undefined") {
+  statusEl.textContent = "Impossible de charger MapLibre GL (scripts externes bloqués dans cet aperçu). Téléchargez le fichier HTML et ouvrez-le dans un navigateur.";
+} else {
+  statusEl.remove();
+
+  const map = new maplibregl.Map({
+    container: "map",
+    style: {
+      version: 8,
+      sources: {
+        "ign-plan": {
+          type: "raster",
+          tiles: [IGN_PLAN],
+          tileSize: 256,
+          maxzoom: 19,
+          attribution: "IGN — Géoplateforme"
+        }
+      },
+      layers: [{
+        id: "ign", type: "raster", source: "ign-plan", minzoom: 0, maxzoom: 22
+      }]
+    },
+    center: CENTER,
+    zoom: 15.4,
+    pitch: 60,
+    bearing: -25,
+    maxPitch: 85
+  });
+  map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }));
+  map.addControl(new maplibregl.ScaleControl());
+
+  map.on("load", async () => {
+    map.addSource("radius", {
+      type: "geojson",
+      data: { type: "Feature", geometry: circleGeom(CENTER[0], CENTER[1], RADIUS_M), properties: {} }
+    });
+    map.addLayer({
+      id: "radius-fill", type: "fill", source: "radius",
+      paint: { "fill-color": "#2563eb", "fill-opacity": 0.05 }
+    });
+    map.addLayer({
+      id: "radius-line", type: "line", source: "radius",
+      paint: { "line-color": "#2563eb", "line-width": 2, "line-dasharray": [2, 2] }
+    });
+
+    let fc;
+    try {
+      const resp = await fetch(WFS_URL);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      fc = await resp.json();
+    } catch (e) {
+      const s = document.createElement("div");
+      s.id = "status"; s.textContent = "Échec du chargement des données WFS (" + e.message + "). Ouvrez ce fichier dans un navigateur avec accès réseau.";
+      document.body.appendChild(s);
+      return;
+    }
+
+    for (const f of fc.features) {
+      const h = f.properties && f.properties.hauteur;
+      f.properties.hauteur = h || 5; // hauteur de repli si valeur absente
+      f.properties.couleur = natureColor(f.properties.nature);
+    }
+
+    map.addSource("batiments", { type: "geojson", data: fc });
+    map.addLayer({
+      id: "batiments-3d",
+      type: "fill-extrusion",
+      source: "batiments",
+      minzoom: 13,
+      paint: {
+        "fill-extrusion-color": ["get", "couleur"],
+        "fill-extrusion-height": ["get", "hauteur"],
+        "fill-extrusion-base": 0,
+        "fill-extrusion-opacity": 0.85
+      }
+    });
+
+    // Popup au clic
+    map.on("click", "batiments-3d", (e) => {
+      const p = e.features[0].properties;
+      new maplibregl.Popup({ maxWidth: "240px" })
+        .setLngLat(e.lngLat)
+        .setHTML(
+          "<b>" + (p.nature || "Bâtiment") + "</b><br>" +
+          "Usage : " + (p.usage_1 || "—") + "<br>" +
+          "Hauteur : " + (p.hauteur ? p.hauteur + " m" : "—") + "<br>" +
+          "Étages : " + (p.nombre_d_etages != null ? p.nombre_d_etages : "—")
+        )
+        .addTo(map);
+    });
+    map.on("mouseenter", "batiments-3d", () => { map.getCanvas().style.cursor = "pointer"; });
+    map.on("mouseleave", "batiments-3d", () => { map.getCanvas().style.cursor = ""; });
+
+    // Ajuster la vue sur l'emprise des bâtiments
+    const bounds = new maplibregl.LngLatBounds();
+    for (const f of fc.features) {
+      const g = f.geometry;
+      if (g.type === "MultiPolygon") g.coordinates.forEach(p => p[0].forEach(c => bounds.extend(c)));
+      else if (g.type === "Polygon") g.coordinates[0].forEach(c => bounds.extend(c));
+    }
+    map.fitBounds(bounds, { padding: 120, pitch: 60, bearing: -25, duration: 0 });
+  });
+}
+</script>
+</body>
+</html>
